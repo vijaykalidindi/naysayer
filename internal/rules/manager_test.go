@@ -1,6 +1,8 @@
 package rules
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/redhat-data-and-ai/naysayer/internal/config"
@@ -12,10 +14,22 @@ import (
 type stubSectionParser struct {
 	sections   []shared.Section
 	validateFn func(section *shared.Section, rules []shared.Rule) *shared.SectionValidationResult
+	parseFn    func(filePath string, content string) ([]shared.Section, error)
 }
 
 func (sp *stubSectionParser) ParseSections(filePath string, content string) ([]shared.Section, error) {
-	return sp.sections, nil
+	if sp.parseFn != nil {
+		return sp.parseFn(filePath, content)
+	}
+	out := make([]shared.Section, len(sp.sections))
+	copy(out, sp.sections)
+	for i := range out {
+		out[i].Content = content
+		if out[i].FilePath == "" {
+			out[i].FilePath = filePath
+		}
+	}
+	return out, nil
 }
 
 func (sp *stubSectionParser) GetSectionAtLine(sections []shared.Section, lineNumber int) *shared.Section {
@@ -633,6 +647,176 @@ func TestExtractChangedLinesFromDiff_EmptyDiff(t *testing.T) {
 	assert.Empty(t, deletedLines)
 }
 
+func TestExtractChangedLinesFromDiff_NoNewlineMarker(t *testing.T) {
+	manager := NewSectionRuleManager(&config.GlobalRuleConfig{Files: []config.FileRuleConfig{}}, nil)
+
+	diff := "@@ -1,2 +1,3 @@\n line1\n-line2\n\\ No newline at end of file\n+line2\n+line3\n"
+
+	addedLines, deletedLines := manager.extractChangedLinesFromDiff(diff)
+
+	assert.Len(t, deletedLines, 1)
+	assert.Equal(t, 2, deletedLines[0].StartLine)
+	assert.Equal(t, 2, deletedLines[0].EndLine)
+
+	assert.Len(t, addedLines, 1)
+	assert.Equal(t, 2, addedLines[0].StartLine)
+	assert.Equal(t, 3, addedLines[0].EndLine)
+}
+
+func TestEvaluateAll_EmptyDiffFileRequiresManualReview(t *testing.T) {
+	manager := NewSectionRuleManager(&config.GlobalRuleConfig{
+		Enabled: true,
+		Files: []config.FileRuleConfig{
+			{
+				Name:       "product_configs",
+				Path:       "**/",
+				Filename:   "product.yaml",
+				ParserType: "yaml",
+				Enabled:    true,
+				Sections: []config.SectionDefinition{
+					{
+						Name:        "name",
+						YAMLPath:    "name",
+						AutoApprove: true,
+					},
+				},
+			},
+		},
+	}, nil)
+
+	result := manager.EvaluateAll(&shared.MRContext{
+		ProjectID: 123,
+		MRIID:     456,
+		Changes: []gitlab.FileChange{
+			{NewPath: "product.yaml", Diff: ""},
+		},
+		MRInfo: &gitlab.MRInfo{
+			Title:        "chmod only",
+			Author:       "developer",
+			SourceBranch: "feature/empty-diff",
+			TargetBranch: "main",
+		},
+	})
+
+	assert.Equal(t, shared.ManualReview, result.FinalDecision.Type)
+	assert.Equal(t, 1, result.TotalFiles)
+	assert.Equal(t, 0, result.ApprovedFiles)
+	assert.Equal(t, 1, result.ReviewFiles)
+
+	fileValidation := result.FileValidations["product.yaml"]
+	assert.NotNil(t, fileValidation)
+	assert.Equal(t, shared.ManualReview, fileValidation.FileDecision)
+}
+
+func TestEvaluateAll_MixedEmptyDiffRequiresManualReview(t *testing.T) {
+	mockClient := &forkMRTestGitLabClient{
+		targetProjectID: 123,
+		sourceProjectID: 123,
+		targetBranch:    "main",
+		sourceBranch:    "feature/mixed-empty-diff",
+		beforeYAML:      "name: oldname\n",
+		afterYAML:       "name: newname\n",
+	}
+
+	manager := NewSectionRuleManager(&config.GlobalRuleConfig{
+		Enabled: true,
+		Files: []config.FileRuleConfig{
+			{
+				Name:       "product_configs",
+				Path:       "**/",
+				Filename:   "product.yaml",
+				ParserType: "yaml",
+				Enabled:    true,
+				Sections: []config.SectionDefinition{
+					{
+						Name:     "name",
+						YAMLPath: "name",
+						RuleConfigs: []config.RuleConfig{
+							{Name: "metadata_rule", Enabled: true},
+						},
+						AutoApprove: true,
+					},
+				},
+			},
+		},
+	}, mockClient)
+	manager.AddRule(&stubRule{name: "metadata_rule", decision: shared.Approve, reason: "metadata ok"})
+
+	result := manager.EvaluateAll(&shared.MRContext{
+		ProjectID: 123,
+		MRIID:     456,
+		Changes: []gitlab.FileChange{
+			{
+				NewPath: "product.yaml",
+				Diff:    "@@ -1,1 +1,1 @@\n-name: oldname\n+name: newname\n",
+			},
+			{
+				NewPath: "other/product.yaml",
+				Diff:    "",
+			},
+		},
+		MRInfo: &gitlab.MRInfo{
+			Title:        "Mixed empty diff",
+			Author:       "developer",
+			SourceBranch: "feature/mixed-empty-diff",
+			TargetBranch: "main",
+		},
+	})
+
+	assert.Equal(t, shared.ManualReview, result.FinalDecision.Type)
+	assert.Equal(t, 2, result.TotalFiles)
+
+	productValidation := result.FileValidations["product.yaml"]
+	assert.NotNil(t, productValidation)
+	assert.Equal(t, shared.Approve, productValidation.FileDecision,
+		"file with a real diff should still validate normally")
+
+	emptyDiffValidation := result.FileValidations["other/product.yaml"]
+	assert.NotNil(t, emptyDiffValidation)
+	assert.Equal(t, shared.ManualReview, emptyDiffValidation.FileDecision,
+		"listed file with an empty diff must not be auto-approved")
+}
+
+func TestEvaluateAll_NilMRInfoRequiresManualReview(t *testing.T) {
+	manager := NewSectionRuleManager(&config.GlobalRuleConfig{
+		Enabled: true,
+		Files: []config.FileRuleConfig{
+			{
+				Name:       "product_configs",
+				Path:       "**/",
+				Filename:   "product.yaml",
+				ParserType: "yaml",
+				Enabled:    true,
+				Sections: []config.SectionDefinition{
+					{
+						Name:        "name",
+						YAMLPath:    "name",
+						AutoApprove: true,
+					},
+				},
+			},
+		},
+	}, nil)
+
+	result := manager.EvaluateAll(&shared.MRContext{
+		ProjectID: 123,
+		MRIID:     456,
+		Changes: []gitlab.FileChange{
+			{
+				NewPath: "product.yaml",
+				Diff:    "@@ -1,1 +1,1 @@\n-name: oldname\n+name: newname\n",
+			},
+		},
+		MRInfo: nil,
+	})
+
+	assert.Equal(t, shared.ManualReview, result.FinalDecision.Type)
+	assert.Equal(t, 1, result.TotalFiles)
+	fileValidation := result.FileValidations["product.yaml"]
+	assert.NotNil(t, fileValidation)
+	assert.Equal(t, shared.ManualReview, fileValidation.FileDecision)
+}
+
 func TestSectionRuleManager_ValidateFileWithSections_AddsFallbackForMissingExpectedRule(t *testing.T) {
 	manager := NewSectionRuleManager(&config.GlobalRuleConfig{Files: []config.FileRuleConfig{}}, nil)
 
@@ -757,6 +941,149 @@ func TestValidateFileWithSections_UnaffectedSectionDoesNotBlockApproval(t *testi
 
 	assert.Equal(t, shared.Approve, result.FileDecision,
 		"unaffected warehouses section (ManualReview) must not block approval")
+}
+
+func TestValidateFileWithSections_DeletedFieldInExistingSectionRequiresManualReview(t *testing.T) {
+	manager := NewSectionRuleManager(&config.GlobalRuleConfig{Files: []config.FileRuleConfig{}}, nil)
+	manager.AddRule(&stubRule{name: "access_policy_rule", decision: shared.Approve, reason: "unused"})
+
+	parser := &stubSectionParser{
+		sections: []shared.Section{
+			{
+				Name:      "data_product_db_validation",
+				StartLine: 5,
+				EndLine:   12,
+				FilePath:  "product.yaml",
+				RuleConfigs: []config.RuleConfig{
+					{Name: "access_policy_rule", Enabled: true},
+				},
+			},
+		},
+		validateFn: func(section *shared.Section, rules []shared.Rule) *shared.SectionValidationResult {
+			decision := shared.Approve
+			reason := "No access_policy changes detected"
+			if strings.Contains(section.Content, "access_policy:") && len(section.ChangedLines) > 0 {
+				decision = shared.ManualReview
+				reason = "access_policy changes require manual review"
+			}
+			return &shared.SectionValidationResult{
+				Section:  section,
+				Decision: decision,
+				Reason:   reason,
+				RuleResults: []shared.LineValidationResult{
+					{
+						RuleName:     "access_policy_rule",
+						Decision:     decision,
+						Reason:       reason,
+						LineRanges:   section.ChangedLines,
+						WasEvaluated: true,
+					},
+				},
+			}
+		},
+	}
+
+	sourceContent := "---\nname: analytics\nkind: source-aligned\nrover_group: example-analytics\ndata_product_db:\n  presentation_schemas:\n  - name: marts\n    consumers:\n    - name: existing_consumer\n      kind: data_product\n    - name: reporting\n      kind: data_product\n"
+	targetContent := "---\nname: analytics\nkind: source-aligned\nrover_group: example-analytics\ndata_product_db:\n  presentation_schemas:\n  - name: marts\n    access_policy: rh_internal\n    consumers:\n    - name: existing_consumer\n      kind: data_product\n"
+
+	result := manager.validateFileWithSections(
+		"product.yaml",
+		sourceContent,
+		targetContent,
+		parser,
+		[]shared.LineRange{{StartLine: 11, EndLine: 12, FilePath: "product.yaml"}},
+		[]shared.LineRange{{StartLine: 8, EndLine: 8, FilePath: "product.yaml"}},
+		"-    access_policy: rh_internal\n+    - name: reporting",
+		nil,
+	)
+
+	assert.Equal(t, shared.ManualReview, result.FileDecision,
+		"removing access_policy while adding a consumer in the same section must require manual review")
+	found := false
+	for _, rr := range result.RuleResults {
+		if rr.RuleName == "access_policy_rule" && rr.Decision == shared.ManualReview {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "deleted-side access_policy_rule must contribute ManualReview")
+}
+
+func TestValidateFileWithSections_TargetParseFailureRequiresManualReview(t *testing.T) {
+	manager := NewSectionRuleManager(&config.GlobalRuleConfig{Files: []config.FileRuleConfig{}}, nil)
+
+	sourceContent := "name: newname\n"
+	targetContent := "name: oldname\nnot: valid: yaml: ["
+
+	parser := &stubSectionParser{
+		parseFn: func(filePath string, content string) ([]shared.Section, error) {
+			if content == targetContent {
+				return nil, fmt.Errorf("invalid yaml")
+			}
+			return []shared.Section{
+				{
+					Name:      "name",
+					StartLine: 1,
+					EndLine:   1,
+					FilePath:  filePath,
+					Content:   content,
+				},
+			}, nil
+		},
+	}
+
+	result := manager.validateFileWithSections(
+		"product.yaml",
+		sourceContent,
+		targetContent,
+		parser,
+		[]shared.LineRange{{StartLine: 1, EndLine: 1, FilePath: "product.yaml"}},
+		[]shared.LineRange{{StartLine: 1, EndLine: 1, FilePath: "product.yaml"}},
+		"-name: oldname\n+name: newname",
+		nil,
+	)
+
+	assert.Equal(t, shared.ManualReview, result.FileDecision)
+}
+
+func TestValidateFileWithSections_UncoveredDeletedLinesRequireManualReview(t *testing.T) {
+	manager := NewSectionRuleManager(&config.GlobalRuleConfig{Files: []config.FileRuleConfig{}}, nil)
+
+	parser := &stubSectionParser{
+		sections: []shared.Section{
+			{
+				Name:      "name",
+				StartLine: 1,
+				EndLine:   1,
+				FilePath:  "product.yaml",
+			},
+		},
+	}
+
+	sourceContent := ""
+	targetContent := "name: foo\norphan: bar\n"
+
+	result := manager.validateFileWithSections(
+		"product.yaml",
+		sourceContent,
+		targetContent,
+		parser,
+		nil,
+		[]shared.LineRange{{StartLine: 2, EndLine: 2, FilePath: "product.yaml"}},
+		"-orphan: bar",
+		nil,
+	)
+
+	assert.Equal(t, shared.ManualReview, result.FileDecision)
+	assert.NotEmpty(t, result.UncoveredLines)
+	found := false
+	for _, u := range result.UncoveredLines {
+		if u.StartLine <= 2 && u.EndLine >= 2 {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "deleted line 2 is outside any section and must be uncovered")
 }
 
 func TestIsDeletedFile(t *testing.T) {

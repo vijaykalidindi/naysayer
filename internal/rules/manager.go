@@ -169,6 +169,20 @@ func (srm *SectionRuleManager) validateFilesWithSections(mrCtx *shared.MRContext
 		// Get changed lines for the file
 		addedLines, deletedLines := srm.getChangedLinesForFile(filePath, mrCtx)
 
+		if len(addedLines) == 0 && len(deletedLines) == 0 {
+			logging.Warn("No changed lines for %s - requiring manual review", filePath)
+			fileValidations[filePath] = srm.createManualReviewValidation(
+				filePath, 0, "No added or deleted lines found in the diff; cannot validate this file")
+			continue
+		}
+
+		if mrCtx.MRInfo == nil {
+			logging.Warn("MR info not available for %s - requiring manual review", filePath)
+			fileValidations[filePath] = srm.createManualReviewValidation(
+				filePath, 0, "MR branch info not available; cannot fetch file content")
+			continue
+		}
+
 		// Get file content from source branch
 		var sourceFileContent, targetFileContent string
 		if len(addedLines) > 0 {
@@ -264,8 +278,9 @@ func (srm *SectionRuleManager) validateFileWithSections(filePath, sourceFileCont
 
 	// Track which sections were affected by additions (new file sections)
 	affectedSections := make(map[string]bool)
-	var deletedSections []shared.Section
 	var addedSections []shared.Section
+	var deletedSections []shared.Section
+	var deletedAffected []shared.Section
 
 	if len(addedLines) > 0 && sourceFileContent != "" {
 		var err error
@@ -280,28 +295,19 @@ func (srm *SectionRuleManager) validateFileWithSections(filePath, sourceFileCont
 		}
 	}
 
-	// Track which sections were affected by deletions (old file sections)
+	// Track which sections were affected by deletions (old file sections).
+	// Validate those even when the same section name still exists in the new file
+	// (e.g. access_policy removed while a consumer is added under data_product_db).
 	if len(deletedLines) > 0 && targetFileContent != "" {
 		var err error
 		deletedSections, err = parser.ParseSections(filePath, targetFileContent)
 		if err != nil {
-			logging.Warn("Cannot parse old file sections for deletion analysis: %s: %v", filePath, err)
-		} else {
-			affected := srm.getAffectedSections(deletedSections, deletedLines)
-			for _, section := range affected {
-				affectedSections[section.Name] = true
-			}
+			logging.Error("Failed to parse old file sections for %s: %v", filePath, err)
+			return srm.createManualReviewValidation(filePath, shared.CountLines(targetFileContent), fmt.Sprintf("Failed to parse old file sections: %v", err))
 		}
-	}
-
-	addedSectionNames := make(map[string]bool)
-	for _, s := range addedSections {
-		addedSectionNames[s.Name] = true
-	}
-	var pureDeletionSections []shared.Section
-	for _, s := range deletedSections {
-		if !addedSectionNames[s.Name] {
-			pureDeletionSections = append(pureDeletionSections, s)
+		deletedAffected = srm.getAffectedSections(deletedSections, deletedLines)
+		for _, section := range deletedAffected {
+			affectedSections[section.Name] = true
 		}
 	}
 
@@ -323,46 +329,22 @@ func (srm *SectionRuleManager) validateFileWithSections(filePath, sourceFileCont
 	var ruleResults []shared.LineValidationResult
 	var sectionResults []shared.SectionValidationResult
 
-	// Validate addedSections (using addedLines in new file coordinates)
-	for i := range addedSections {
-		section := &addedSections[i]
-		section.ChangedLines = getSectionChangedLines(addedLines, section.StartLine, section.EndLine)
-
-		sectionRules := srm.getEnabledRulesForSection(section.RuleConfigs)
-		sectionResult := parser.ValidateSection(section, sectionRules)
-		sectionResults = append(sectionResults, *sectionResult)
-
-		for _, ruleResult := range sectionResult.RuleResults {
-			ruleResults = append(ruleResults, ruleResult)
-			allCoveredLines = append(allCoveredLines, ruleResult.LineRanges...)
-		}
-	}
-
-	// Validate pureDeletionSections (using deletedLines in old file coordinates)
-	for i := range pureDeletionSections {
-		section := &pureDeletionSections[i]
-		section.ChangedLines = getSectionChangedLines(deletedLines, section.StartLine, section.EndLine)
-
-		sectionRules := srm.getEnabledRulesForSection(section.RuleConfigs)
-		sectionResult := parser.ValidateSection(section, sectionRules)
-		sectionResults = append(sectionResults, *sectionResult)
-
-		for _, ruleResult := range sectionResult.RuleResults {
-			ruleResults = append(ruleResults, ruleResult)
-			allCoveredLines = append(allCoveredLines, ruleResult.LineRanges...)
-		}
-	}
+	sectionResults, ruleResults, allCoveredLines = srm.validateSections(parser, addedSections, addedLines, sectionResults, ruleResults, allCoveredLines)
+	sectionResults, ruleResults, allCoveredLines = srm.validateSections(parser, deletedAffected, deletedLines, sectionResults, ruleResults, allCoveredLines)
 
 	// Generic defense-in-depth:
 	// if a changed section expects a rule that did not produce a result,
 	// inject a manual-review fallback without overwriting existing reasons.
-	allSections := append(addedSections, pureDeletionSections...)
+	allSections := append(addedSections, deletedAffected...)
 	expectedRules := srm.getExpectedRulesForAffectedSections(allSections, affectedSections)
 	ruleResults = srm.appendMissingExpectedRuleFallbacks(ruleResults, expectedRules, addedLines)
 
-	// Check for uncovered lines (lines not in any section)
-	// Only consider lines that were actually changed in this MR
-	uncoveredLines := srm.getUncoveredLinesInChanges(shared.CountLines(sourceFileContent), allSections, addedLines)
+	// Check for uncovered lines (lines not in any section).
+	// Added and deleted ranges use their own file coordinates so they are not mixed.
+	uncoveredLines := srm.getUncoveredLinesInChanges(shared.CountLines(sourceFileContent), addedSections, addedLines)
+	if len(deletedLines) > 0 {
+		uncoveredLines = append(uncoveredLines, srm.getUncoveredLinesInChanges(shared.CountLines(targetFileContent), deletedSections, deletedLines)...)
+	}
 
 	// Filter results: only affected sections influence the decision.
 	// Unaffected sections are still validated (for MR comment display) but
@@ -398,6 +380,25 @@ func (srm *SectionRuleManager) validateFileWithSections(filePath, sourceFileCont
 		RuleResults:    ruleResults,
 		FileDecision:   fileDecision,
 	}
+}
+
+// validateSections runs configured rules for each section using the given line coordinates
+// (addedLines in new-file space, or deletedLines in old-file space).
+func (srm *SectionRuleManager) validateSections(parser shared.SectionParser, sections []shared.Section, changedLines []shared.LineRange, sectionResults []shared.SectionValidationResult, ruleResults []shared.LineValidationResult, allCoveredLines []shared.LineRange) ([]shared.SectionValidationResult, []shared.LineValidationResult, []shared.LineRange) {
+	for i := range sections {
+		section := &sections[i]
+		section.ChangedLines = getSectionChangedLines(changedLines, section.StartLine, section.EndLine)
+
+		sectionRules := srm.getEnabledRulesForSection(section.RuleConfigs)
+		sectionResult := parser.ValidateSection(section, sectionRules)
+		sectionResults = append(sectionResults, *sectionResult)
+
+		for _, ruleResult := range sectionResult.RuleResults {
+			ruleResults = append(ruleResults, ruleResult)
+			allCoveredLines = append(allCoveredLines, ruleResult.LineRanges...)
+		}
+	}
+	return sectionResults, ruleResults, allCoveredLines
 }
 
 // getSectionChangedLines converts file-level changedLines to section-relative
@@ -782,6 +783,11 @@ func (srm *SectionRuleManager) extractChangedLinesFromDiff(diff string) (addedLi
 		}
 
 		if newLineNum == 0 && oldLineNum == 0 {
+			continue
+		}
+
+		// "\ No newline at end of file" is a marker, not file content.
+		if strings.HasPrefix(line, "\\") {
 			continue
 		}
 
