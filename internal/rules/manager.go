@@ -212,7 +212,7 @@ func (srm *SectionRuleManager) validateFilesWithSections(mrCtx *shared.MRContext
 		if parser != nil {
 			logging.Info("Using section-based validation for file: %s", filePath)
 			// Use section-based validation with delta approach
-			fileValidation := srm.validateFileWithSections(filePath, sourceFileContent, targetFileContent, parser, addedLines, deletedLines, diffText, mrCtx)
+			fileValidation := srm.validateFileWithSections(filePath, sourceFileContent, targetFileContent, parser, addedLines, deletedLines, diffText)
 			fileValidations[filePath] = fileValidation
 		} else {
 			logging.Info("No parser found for file: %s - requiring manual review", filePath)
@@ -274,7 +274,8 @@ func (srm *SectionRuleManager) getDiffForFile(filePath string, mrCtx *shared.MRC
 
 // validateFileWithSections validates a file using section-based approach with delta validation.
 // addedLines are positions in the new file (source branch), deletedLines are positions in the old file (target branch).
-func (srm *SectionRuleManager) validateFileWithSections(filePath, sourceFileContent, targetFileContent string, parser shared.SectionParser, addedLines, deletedLines []shared.LineRange, diffText string, mrCtx *shared.MRContext) *shared.FileValidationSummary {
+func (srm *SectionRuleManager) validateFileWithSections(filePath, sourceFileContent, targetFileContent string,
+	parser shared.SectionParser, addedLines, deletedLines []shared.LineRange, diffText string) *shared.FileValidationSummary {
 
 	// Track which sections were affected by additions (new file sections)
 	affectedSections := make(map[string]bool)

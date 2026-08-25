@@ -250,7 +250,7 @@ func TestSectionRuleManager_CodeownersFileValidation(t *testing.T) {
 
 	// Step 4: Full validation — codeowners_sync_rule is not registered in the manager
 	// (no AddRule was called), so the fallback mechanism injects a manual review.
-	result := manager.validateFileWithSections("CODEOWNERS", codeownersContent, "", parser, changedLines, nil, diff, nil)
+	result := manager.validateFileWithSections("CODEOWNERS", codeownersContent, "", parser, changedLines, nil, diff)
 	assert.NotNil(t, result)
 	assert.Equal(t, shared.ManualReview, result.FileDecision,
 		"codeowners_sync_rule not registered → fallback manual review expected")
@@ -855,7 +855,6 @@ func TestSectionRuleManager_ValidateFileWithSections_AddsFallbackForMissingExpec
 		changedLines,
 		nil,
 		"+warehouses:",
-		nil,
 	)
 
 	assert.Equal(t, shared.ManualReview, result.FileDecision)
@@ -936,7 +935,6 @@ func TestValidateFileWithSections_UnaffectedSectionDoesNotBlockApproval(t *testi
 		changedLines,
 		nil,
 		"+  version: v1.1.0\n+  owner: team",
-		nil,
 	)
 
 	assert.Equal(t, shared.Approve, result.FileDecision,
@@ -994,7 +992,6 @@ func TestValidateFileWithSections_DeletedFieldInExistingSectionRequiresManualRev
 		[]shared.LineRange{{StartLine: 11, EndLine: 12, FilePath: "product.yaml"}},
 		[]shared.LineRange{{StartLine: 8, EndLine: 8, FilePath: "product.yaml"}},
 		"-    access_policy: rh_internal\n+    - name: reporting",
-		nil,
 	)
 
 	assert.Equal(t, shared.ManualReview, result.FileDecision,
@@ -1040,7 +1037,6 @@ func TestValidateFileWithSections_TargetParseFailureRequiresManualReview(t *test
 		[]shared.LineRange{{StartLine: 1, EndLine: 1, FilePath: "product.yaml"}},
 		[]shared.LineRange{{StartLine: 1, EndLine: 1, FilePath: "product.yaml"}},
 		"-name: oldname\n+name: newname",
-		nil,
 	)
 
 	assert.Equal(t, shared.ManualReview, result.FileDecision)
@@ -1071,7 +1067,6 @@ func TestValidateFileWithSections_UncoveredDeletedLinesRequireManualReview(t *te
 		nil,
 		[]shared.LineRange{{StartLine: 2, EndLine: 2, FilePath: "product.yaml"}},
 		"-orphan: bar",
-		nil,
 	)
 
 	assert.Equal(t, shared.ManualReview, result.FileDecision)
